@@ -1,0 +1,8 @@
+[package]
+name = "xlua"
+version = "0.1.0"
+authors = ["xavil <max.duzen@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+ansi_term = "0.11.0"
