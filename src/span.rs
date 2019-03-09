@@ -7,6 +7,22 @@ pub struct Index {
     pub byte: usize,
 }
 
+fn idx_min(a: Index, b: Index) -> Index {
+    if a.byte < b.byte {
+        a
+    } else {
+        b
+    }
+}
+
+fn idx_max(a: Index, b: Index) -> Index {
+    if a.byte > b.byte {
+        a
+    } else {
+        b
+    }
+}
+
 impl Index {
     pub fn advance_by(mut self, ch: char) -> Self {
         self.byte += ch.len_utf8();
@@ -33,9 +49,25 @@ impl Span {
         Span { start, end }
     }
 
-    pub fn advance_front(mut self, ch: char) -> Self {
-        self.start.advance_by(ch);
+    pub fn shrink_n_same_line(mut self, n: usize) -> Self {
+        self.start.byte += n;
+        self.start.column += n;
+        self.end.byte -= n;
+        self.end.column -= n;
         self
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.end.byte - self.start.byte
+    }
+
+    pub fn union(self, other: Span) -> Self {
+        assert!(self.end.byte >= self.start.byte);
+
+        let lo = idx_min(self.start, other.start);
+        let hi = idx_max(self.end, other.end);
+
+        Span { start: lo, end: hi }
     }
 
     pub fn error_diagnostic(self) -> Diagnostic {

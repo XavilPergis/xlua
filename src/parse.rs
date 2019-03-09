@@ -2,6 +2,7 @@ use crate::error::ErrorManager;
 use crate::error::Level;
 use crate::span::Index;
 use crate::span::Span;
+// use crate::token::tok;
 use crate::token::SpannedToken;
 use crate::token::{Keyword, Token};
 
@@ -107,7 +108,7 @@ pub enum Expr {
     Varargs,
 
     Number(f64),
-    StringLiteral(String),
+    String(String),
 
     /// Closure expression. List of arguments, function body, whether or not the function is varadic.
     Func(Func),
@@ -164,6 +165,36 @@ pub enum BinOp {
     Or,
 }
 
+impl BinOp {
+    /// Binary operator precedence
+    fn precedence(&self) -> usize {
+        use self::BinOp::*;
+        match self {
+            Or => 0,
+            And => 1,
+
+            Less | LessEq | Greater | GreaterEq | Eq | NotEq => 2,
+
+            BitOr => 3,
+            BitXor => 4,
+            BitAnd => 5,
+            BitShr | BitShl => 6,
+            Concat => 7,
+
+            Add | Sub => 8,
+            Mul | Div | FloorDiv | Mod => 9,
+            Exp => 10,
+        }
+    }
+
+    fn is_right_assoc(&self) -> bool {
+        match self {
+            BinOp::Concat | BinOp::Exp => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum UnOp {
     Minus,
@@ -183,10 +214,6 @@ pub struct Parser<'src, 'ctx> {
     errs: &'ctx mut ErrorManager,
 }
 
-struct ParseFail {}
-
-type PResult<T> = Result<T, ParseFail>;
-
 impl<'src, 'ctx> Parser<'src, 'ctx> {
     pub fn new(src: &'src str, tokens: &'src [SpannedToken], errs: &'ctx mut ErrorManager) -> Self {
         Parser {
@@ -200,7 +227,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
 
     fn dbg_pad(&self) {
         for _ in 0..self.dbg_spaces {
-            print!("| ");
+            print!("  ");
         }
     }
 
@@ -212,11 +239,14 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         self.idx + lookahead < self.tokens.len() && self.tokens[self.idx + lookahead].ty == tok
     }
 
-    fn eat(&mut self, tok: Token) -> Option<()> {
+    fn eat(&mut self, expect: bool, tok: Token) -> Option<()> {
         if self.check(tok) {
             self.bump();
             Some(())
         } else {
+            if expect {
+                self.expect_err(tok);
+            }
             None
         }
     }
@@ -228,7 +258,11 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
 
     fn expect_err<T: std::fmt::Debug>(&mut self, item: T) {
         self.dbg_pad();
-        println!("@! bad expect {:?} / {:?}", item, self.next().map(|t| t.ty));
+        println!(
+            "\x1b[31m@! bad expect {:?} / {:?}\x1b[0m",
+            item,
+            self.next().map(|t| t.ty)
+        );
         match self.next() {
             Some(next) => self.errs.span_error(
                 next.span
@@ -253,15 +287,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         }
     }
 
-    fn expect(&mut self, tok: Token) -> Option<()> {
-        if self.eat(tok).is_some() {
-            Some(())
-        } else {
-            self.expect_err(tok);
-            None
-        }
-    }
-
     fn next(&self) -> Option<&'src SpannedToken> {
         self.tokens.get(self.idx)
     }
@@ -272,28 +297,68 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
 
     fn bump(&mut self) {
         self.dbg_pad();
-        println!("@ bumped {:?}", self.tokens[self.idx].ty);
+        println!("\x1b[32m@ bumped {:?}\x1b[0m", self.tokens[self.idx].ty);
         self.idx += 1;
     }
 
-    fn eat_ident(&mut self) -> Option<&'src str> {
+    fn consume(&mut self, num_tokens: usize) {
+        self.dbg_pad();
+        println!(
+            "\x1b[33m@ bumped {} tokens ({:?})\x1b[0m",
+            num_tokens,
+            &self.tokens[self.idx..self.idx + num_tokens]
+        );
+        self.idx += num_tokens;
+    }
+
+    fn eat_ident(&mut self, expect: bool) -> Option<&'src str> {
         if self.check(Token::Ident) {
             let span = self.next()?.span;
             self.bump();
             Some(&self.src[span.start.byte..span.end.byte])
         } else {
+            if expect {
+                self.expect_err("ident");
+            }
             None
         }
     }
 
-    fn expect_ident(&mut self) -> Option<&'src str> {
-        if self.check(Token::Ident) {
-            let span = self.next()?.span;
-            self.bump();
-            Some(&self.src[span.start.byte..span.end.byte])
-        } else {
-            self.expect_err("ident");
-            None
+    fn tok_err(&mut self, header: &'static str, annotations: impl IntoIterator<Item = String>) {
+        if let Some(tok) = self.next() {
+            let mut msg = tok.span.error_diagnostic().with_message(header);
+            for ann in annotations {
+                msg = msg.with_annotation(Level::Note, ann);
+            }
+            self.errs.span_error(msg);
+        }
+    }
+
+    fn span_err(
+        &mut self,
+        span: Span,
+        header: &'static str,
+        annotations: impl IntoIterator<Item = String>,
+    ) {
+        let mut msg = span.error_diagnostic().with_message(header);
+        for ann in annotations {
+            msg = msg.with_annotation(Level::Note, ann);
+        }
+        self.errs.span_error(msg);
+    }
+
+    fn span_union_err(
+        &mut self,
+        span: Span,
+        header: &'static str,
+        annotations: impl IntoIterator<Item = String>,
+    ) {
+        if let Some(tok) = self.next() {
+            let mut msg = span.union(tok.span).error_diagnostic().with_message(header);
+            for ann in annotations {
+                msg = msg.with_annotation(Level::Note, ann);
+            }
+            self.errs.span_error(msg);
         }
     }
 }
@@ -305,10 +370,8 @@ macro_rules! dbg_wrap {
         $self.dbg_spaces += 1;
         let ret = $closure();
         $self.dbg_spaces -= 1;
-        $self.dbg_pad();
-        println!("< {:?}", ret);
         // $self.dbg_pad();
-        // println!("+<-- {} {:?}", $name, ret);
+        // println!("< {}", $name);
         ret
     }};
 }
@@ -316,22 +379,33 @@ macro_rules! dbg_wrap {
 impl Parser<'_, '_> {
     // chunk := <block> ;;
     pub fn p_chunk(&mut self) -> Option<Block> {
-        dbg_wrap!(self, "p_chunk", || self.p_block())
+        dbg_wrap!(self, "p_chunk", || {
+            let block = self.p_block();
+            if self.next().is_some() {
+                self.tok_err(
+                    "incomplete parse",
+                    vec!["I tried parsing the whole file but only got part way through".into()],
+                );
+                None
+            } else {
+                Some(block)
+            }
+        })
     }
 
     // block := <stat>* <retstat>? ;;
-    fn p_block(&mut self) -> Option<Block> {
+    fn p_block(&mut self) -> Block {
         dbg_wrap!(self, "p_block", || {
             let mut statements = vec![];
             while let Some(stmt) = self.p_stat() {
                 statements.push(stmt);
             }
-            let return_statement = self.p_retstat();
+            let return_statement = self.p_retstat(false);
 
-            Some(Block {
+            Block {
                 statements,
                 return_statement,
-            })
+            }
         })
     }
 
@@ -363,30 +437,35 @@ impl Parser<'_, '_> {
                 }
                 Token::Kw(Keyword::Goto) => {
                     self.bump();
-                    if let Some(ident) = self.eat_ident() {
+                    if let Some(ident) = self.eat_ident(false) {
                         Statement::Goto(ident.into())
                     } else {
-                        unimplemented!()
+                        self.tok_err(
+                            "invalid goto target",
+                            vec!["I can't jump to anything other than a label name!".into()],
+                        );
+                        self.p_stat()?
                     }
                 }
                 Token::Kw(Keyword::Do) => {
                     self.bump();
-                    let block = self.p_block()?;
-                    self.expect(Token::Kw(Keyword::End))?;
+                    let block = self.p_block();
+                    self.eat(true, Token::Kw(Keyword::End))?;
                     Statement::Do(block)
                 }
                 Token::Kw(Keyword::While) => {
                     self.bump();
-                    let cond = self.p_exp()?;
-                    self.expect(Token::Kw(Keyword::Do))?;
-                    let block = self.p_block()?;
+                    let cond = self.p_exp(true)?;
+                    self.eat(true, Token::Kw(Keyword::Do))?;
+                    let block = self.p_block();
+                    self.eat(true, Token::Kw(Keyword::End))?;
                     Statement::While(ExprAndBlock { cond, block })
                 }
                 Token::Kw(Keyword::Repeat) => {
                     self.bump();
-                    let block = self.p_block()?;
-                    self.expect(Token::Kw(Keyword::Until))?;
-                    let cond = self.p_exp()?;
+                    let block = self.p_block();
+                    self.eat(true, Token::Kw(Keyword::Until))?;
+                    let cond = self.p_exp(true)?;
                     Statement::Repeat(ExprAndBlock { cond, block })
                 }
                 // The colon syntax is used for defining methods, that is, functions that have an implicit extra parameter self. Thus, the statement
@@ -395,8 +474,8 @@ impl Parser<'_, '_> {
                 //     t.a.b.c.f = function (self, params) body end
                 Token::Kw(Keyword::Function) => {
                     self.bump();
-                    let (lhs_path, method) = self.p_funcname()?;
-                    let mut body = self.p_funcbody()?;
+                    let (lhs_path, method) = self.p_funcname(true)?;
+                    let mut body = self.p_funcbody(true)?;
 
                     // If this is a method, add `self` as the first param
                     if method.is_some() {
@@ -413,7 +492,7 @@ impl Parser<'_, '_> {
                                 let idx = path.pop().unwrap();
                                 Lhs::Index(
                                     Box::new(Expr::Lhs(path_to_lhs(path))),
-                                    Box::new(Expr::StringLiteral(idx)),
+                                    Box::new(Expr::String(idx)),
                                 )
                             }
                         }
@@ -421,10 +500,7 @@ impl Parser<'_, '_> {
 
                     let lhs = path_to_lhs(lhs_path);
                     let lhs = if let Some(ident) = method {
-                        Lhs::Index(
-                            Box::new(Expr::Lhs(lhs)),
-                            Box::new(Expr::StringLiteral(ident)),
-                        )
+                        Lhs::Index(Box::new(Expr::Lhs(lhs)), Box::new(Expr::String(ident)))
                     } else {
                         lhs
                     };
@@ -433,35 +509,56 @@ impl Parser<'_, '_> {
                 }
                 Token::Kw(Keyword::Local) => {
                     self.bump();
-                    if self.eat(Token::Kw(Keyword::Function)).is_some() {
-                        let ident = self.eat_ident()?.into();
-                        let body = self.p_funcbody()?;
+                    if self.eat(false, Token::Kw(Keyword::Function)).is_some() {
+                        let ident = self.eat_ident(true)?.into();
+                        let body = self.p_funcbody(true)?;
                         Statement::LocalFunc(ident, body)
                     } else {
-                        let names = self.p_namelist()?;
-                        let vals = if self.eat(Token::Eq).is_some() {
-                            Some(self.p_explist()?)
+                        let names = self.p_namelist(true)?;
+                        let vals = if self.eat(false, Token::Eq).is_some() {
+                            Some(self.p_explist(true)?)
                         } else {
                             None
                         };
                         Statement::Local(names, vals)
                     }
                 }
-                Token::ColonColon => Statement::Label(self.p_label()?),
-                Token::Kw(Keyword::If) => Statement::If(self.p_if_stat()?),
-                Token::Kw(Keyword::For) => Statement::For(self.p_for_stat()?),
+                Token::ColonColon => Statement::Label(self.p_label(true)?),
+                Token::Kw(Keyword::If) => Statement::If(self.p_if_stat(true)?),
+                Token::Kw(Keyword::For) => Statement::For(self.p_for_stat(true)?),
 
                 Token::Ident => {
+                    let list_start = self.next().unwrap().span;
                     // starts with an ident so it's either an assignment or a function call...
-                    // if we are looking at a var list, then we have `[ident] "," ...` or `[ident] "=" ...`
-                    // otherwise, we probably have a function call.
-                    if self.check_lookahead(1, Token::Comma) || self.check_lookahead(1, Token::Eq) {
-                        let vars = self.p_varlist()?;
-                        self.expect(Token::Eq)?;
-                        let exprs = self.p_explist()?;
-                        Statement::Assign(vars, exprs)
-                    } else {
-                        Statement::Call(self.p_functioncall()?)
+                    // if we are looking at a var list, then we have `<lhs> ","` or `<lhs> "="`.
+                    // Otherwise, we have `<expr> "(" <explist> ")"`
+                    let expr = self.p_exp(true)?;
+
+                    match expr {
+                        // We have an lhs, but it might be the start of a list of assignables.
+                        // If the next token is an `=`, then we have a single element list.
+                        // If the next token is a `,`, then we have more than a single lhs.
+                        Expr::Lhs(lhs) => {
+                            let mut assignables = vec![lhs];
+
+                            if self.eat(false, Token::Comma).is_some() {
+                                let list = self.p_varlist(true);
+                                match list {
+                                    Some(list) => assignables.extend(list),
+                                    None => self.span_union_err(
+                                        list_start,
+                                        "invalid expression list",
+                                        vec!["".into()],
+                                    ),
+                                }
+                            }
+                            self.eat(true, Token::Eq)?;
+                            let exprs = self.p_explist(true)?;
+
+                            Statement::Assign(assignables, exprs)
+                        }
+                        Expr::Call(call) => Statement::Call(call),
+                        _ => unimplemented!(),
                     }
                 }
 
@@ -471,28 +568,29 @@ impl Parser<'_, '_> {
     }
 
     // if_stmt  := "if" <exp> "then" <block> ("elseif" <exp> "then" <block>)* ("else" <block>)? "end" ;;
-    fn p_if_stat(&mut self) -> Option<If> {
+    fn p_if_stat(&mut self, expect: bool) -> Option<If> {
         dbg_wrap!(self, "p_if_stat", || {
-            self.eat(Token::Kw(Keyword::If))?;
-            let cond = self.p_exp()?;
-            self.expect(Token::Kw(Keyword::Then))?;
-            let block = self.p_block()?;
+            self.eat(expect, Token::Kw(Keyword::If))?;
+            let cond = self.p_exp(true)?;
+            self.eat(true, Token::Kw(Keyword::Then))?;
+            let block = self.p_block();
             let if_clause = ExprAndBlock { cond, block };
 
             let mut elseif_clauses = vec![];
-            while self.eat(Token::Kw(Keyword::ElseIf)).is_some() {
-                let cond = self.p_exp()?;
-                self.expect(Token::Kw(Keyword::Then))?;
-                let block = self.p_block()?;
+            while self.eat(false, Token::Kw(Keyword::ElseIf)).is_some() {
+                let cond = self.p_exp(true)?;
+                self.eat(true, Token::Kw(Keyword::Then))?;
+                let block = self.p_block();
                 elseif_clauses.push(ExprAndBlock { cond, block })
             }
 
-            let else_clause = if self.eat(Token::Kw(Keyword::Else)).is_some() {
-                Some(self.p_block()?)
+            let else_clause = if self.eat(false, Token::Kw(Keyword::Else)).is_some() {
+                Some(self.p_block())
             } else {
                 None
             };
 
+            self.eat(true, Token::Kw(Keyword::End))?;
             Some(If {
                 if_clause,
                 elseif_clauses,
@@ -503,27 +601,24 @@ impl Parser<'_, '_> {
 
     // for_stmt := "for" :name "=" <exp> "," <exp> ("," <exp>)? "do" <block> "end"
     // 	         | "for" <namelist> "in" <explist> "do" <block> "end" ;;
-    fn p_for_stat(&mut self) -> Option<For> {
+    fn p_for_stat(&mut self, expect: bool) -> Option<For> {
         dbg_wrap!(self, "p_for_stat", || {
-            self.eat(Token::Kw(Keyword::For))?;
+            self.eat(expect, Token::Kw(Keyword::For))?;
             Some(if self.check_lookahead(1, Token::Eq) {
-                println!("numeric for");
                 // numerical for loop
-                let binding = self.eat_ident()?.into();
-                println!("foo {:?}", binding);
-                self.expect(Token::Eq)?;
-                println!("bar");
-                let start = self.p_exp()?;
-                self.expect(Token::Comma)?;
-                let end = self.p_exp()?;
-                let step = if self.eat(Token::Comma).is_some() {
-                    Some(self.p_exp()?)
+                let binding = self.eat_ident(true)?.into();
+                self.eat(true, Token::Eq)?;
+                let start = self.p_exp(true)?;
+                self.eat(true, Token::Comma)?;
+                let end = self.p_exp(true)?;
+                let step = if self.eat(false, Token::Comma).is_some() {
+                    Some(self.p_exp(true)?)
                 } else {
                     None
                 };
-                self.expect(Token::Kw(Keyword::Do))?;
-                let block = self.p_block()?;
-                self.expect(Token::Kw(Keyword::End))?;
+                self.eat(true, Token::Kw(Keyword::Do))?;
+                let block = self.p_block();
+                self.eat(true, Token::Kw(Keyword::End))?;
 
                 For::Numeric {
                     binding,
@@ -533,13 +628,12 @@ impl Parser<'_, '_> {
                     block,
                 }
             } else {
-                println!("generic for");
-                let bindings = self.p_namelist()?;
-                self.expect(Token::Kw(Keyword::In))?;
-                let iterators = self.p_explist()?;
-                self.expect(Token::Kw(Keyword::Do))?;
-                let block = self.p_block()?;
-                self.expect(Token::Kw(Keyword::End))?;
+                let bindings = self.p_namelist(true)?;
+                self.eat(true, Token::Kw(Keyword::In))?;
+                let iterators = self.p_explist(true)?;
+                self.eat(true, Token::Kw(Keyword::Do))?;
+                let block = self.p_block();
+                self.eat(true, Token::Kw(Keyword::End))?;
                 For::Generic {
                     bindings,
                     iterators,
@@ -550,36 +644,37 @@ impl Parser<'_, '_> {
     }
 
     // retstat := "return" <explist>? ";"? ;;
-    fn p_retstat(&mut self) -> Option<List<Expr>> {
+    fn p_retstat(&mut self, expect: bool) -> Option<List<Expr>> {
         dbg_wrap!(self, "p_retstat", || {
-            self.eat(Token::Kw(Keyword::Return))?;
-            let exprs = self.p_explist()?;
-            let _ = self.eat(Token::Semicolon);
+            self.eat(expect, Token::Kw(Keyword::Return))?;
+            // TODO: is not expecting correct here?
+            let exprs = self.p_explist(false)?;
+            let _ = self.eat(false, Token::Semicolon);
             Some(exprs)
         })
     }
 
     // label := "::" :name "::" ;;
-    fn p_label(&mut self) -> Option<Name> {
+    fn p_label(&mut self, expect: bool) -> Option<Name> {
         dbg_wrap!(self, "p_label", || {
-            self.eat(Token::ColonColon)?;
-            let name = self.eat_ident()?;
-            self.expect(Token::ColonColon)?;
+            self.eat(expect, Token::ColonColon)?;
+            let name = self.eat_ident(true)?;
+            self.eat(true, Token::ColonColon)?;
             Some(name.into())
         })
     }
 
     // funcname := :name ("." :name)* (":" :name)? ;;
-    fn p_funcname(&mut self) -> Option<(List<Name>, Option<Name>)> {
+    fn p_funcname(&mut self, expect: bool) -> Option<(List<Name>, Option<Name>)> {
         dbg_wrap!(self, "p_funcname", || {
-            let mut path = vec![self.eat_ident()?.into()];
+            let mut path = vec![self.eat_ident(expect)?.into()];
 
-            while self.eat(Token::Dot).is_some() {
-                path.push(self.eat_ident()?.into());
+            while self.eat(false, Token::Dot).is_some() {
+                path.push(self.eat_ident(true)?.into());
             }
 
-            let method = if self.eat(Token::Colon).is_some() {
-                Some(self.eat_ident()?.into())
+            let method = if self.eat(false, Token::Colon).is_some() {
+                Some(self.eat_ident(true)?.into())
             } else {
                 None
             };
@@ -589,29 +684,31 @@ impl Parser<'_, '_> {
     }
 
     // varlist := <var> ("," <var>)* ;;
-    fn p_varlist(&mut self) -> Option<List<Lhs>> {
-        dbg_wrap!(self, "p_varlist", || self.p_list_generic(|p| p.p_var()))
+    fn p_varlist(&mut self, expect: bool) -> Option<List<Lhs>> {
+        dbg_wrap!(self, "p_varlist", || self
+            .p_list_generic(expect, |p, e| p.p_var(e)))
     }
 
     // namelist := :name ("," :name)* ;;
-    fn p_namelist(&mut self) -> Option<List<Name>> {
+    fn p_namelist(&mut self, expect: bool) -> Option<List<Name>> {
         dbg_wrap!(self, "p_namelist", || self
-            .p_list_generic(|p| p.eat_ident().map(Into::into)))
+            .p_list_generic(expect, |p, e| p.eat_ident(e).map(Into::into)))
     }
 
     // explist := <exp> ("," <exp>)* ;;
-    fn p_explist(&mut self) -> Option<List<Expr>> {
-        dbg_wrap!(self, "p_explist", || self.p_list_generic(|p| p.p_exp()))
+    fn p_explist(&mut self, expect: bool) -> Option<List<Expr>> {
+        dbg_wrap!(self, "p_explist", || self
+            .p_list_generic(expect, |p, e| p.p_exp(e)))
     }
 
-    fn p_list_generic<T, F>(&mut self, mut func: F) -> Option<List<T>>
+    fn p_list_generic<T, F>(&mut self, expect: bool, mut func: F) -> Option<List<T>>
     where
-        F: FnMut(&mut Self) -> Option<T>,
+        F: FnMut(&mut Self, bool) -> Option<T>,
     {
         // dbg_wrap!(self, "p_for_stat", || {
-        let mut list = vec![func(self)?];
-        while self.eat(Token::Comma).is_some() {
-            list.push(func(self)?);
+        let mut list = vec![func(self, expect)?];
+        while self.eat(false, Token::Comma).is_some() {
+            list.push(func(self, true)?);
         }
         Some(list)
         // })
@@ -620,9 +717,9 @@ impl Parser<'_, '_> {
     // exp := <value>
     //      | <unop> <exp>
     //      | <exp> <binop> <exp> ;;
-    fn p_exp(&mut self) -> Option<Expr> {
+    fn p_exp(&mut self, expect: bool) -> Option<Expr> {
         dbg_wrap!(self, "p_exp", || {
-            let lhs = self.p_exp_primary()?;
+            let lhs = self.p_exp_primary(expect)?;
             self.p_exp_r(lhs, 0)
         })
     }
@@ -630,16 +727,27 @@ impl Parser<'_, '_> {
     fn p_exp_r(&mut self, lhs: Expr, min_prec: usize) -> Option<Expr> {
         dbg_wrap!(self, "p_exp_r", || {
             let mut lhs = lhs;
+            // Every iteration of this loop associates to the left
             loop {
                 match self.next().and_then(|tok| binop_token(&tok.ty)) {
-                    Some(op) if binop_prec(op) >= min_prec => {
+                    // While the current token is a binary operator with a precedence that is greater than the current
+                    // precedence,
+                    Some(op) if op.precedence() >= min_prec => {
                         self.bump();
-                        let mut rhs = self.p_exp_primary()?;
+                        let mut rhs = self.p_exp_primary(true)?;
 
+                        // Every iteration of this loop associates to the right. With `A + B * C`, `B * C` gets
+                        // grouped into a single expression, leaving `A + E`, which then gets grouped into an
+                        // expression by the lhs assignment.
                         loop {
                             match self.next().and_then(|tok| binop_token(&tok.ty)) {
-                                Some(nop) if binop_prec(nop) > binop_prec(op) => {
-                                    rhs = self.p_exp_r(rhs, binop_prec(nop))?
+                                Some(nop)
+                                    if nop.precedence() > op.precedence()
+                                        || (nop.precedence() == op.precedence()
+                                            && nop.is_right_assoc()) =>
+                                {
+                                    // Group everything with a greater precedence
+                                    rhs = self.p_exp_r(rhs, nop.precedence())?;
                                 }
                                 _ => break,
                             }
@@ -655,22 +763,20 @@ impl Parser<'_, '_> {
         })
     }
 
-    // NOTE: `<unop> <primary>` do that `-a + b` is `((-a) + (b))` and not `(-((a) + (b)))` like you'd get with `<unop> <exp>`
-    // exp-primary := <value> | <unop> <exp-primary> ;;
-    fn p_exp_primary(&mut self) -> Option<Expr> {
+    fn p_exp_primary(&mut self, expect: bool) -> Option<Expr> {
         dbg_wrap!(
             self,
             "p_exp_primary",
             || if let Some(unop) = self.p_unop() {
-                Some(Expr::UnOp(unop, Box::new(self.p_exp_primary()?)))
+                Some(Expr::UnOp(unop, Box::new(self.p_exp_primary(true)?)))
             } else {
-                self.p_value()
+                self.p_value(expect)
             }
         )
     }
 
     // value = literal | '...' | function | table-cons | function-call | var | '(' expr ')' ;
-    fn p_value(&mut self) -> Option<Expr> {
+    fn p_value(&mut self, expect: bool) -> Option<Expr> {
         dbg_wrap!(self, "p_value", || Some(match self.next()?.ty {
             Token::DotDotDot => {
                 self.bump();
@@ -690,33 +796,31 @@ impl Parser<'_, '_> {
             }
             Token::Kw(Keyword::Function) => {
                 self.bump();
-                Expr::Func(self.p_funcbody()?)
+                Expr::Func(self.p_funcbody(true)?)
             }
-            Token::LongString | Token::SingleQuoteString | Token::DoubleQuoteString => {
-                Expr::StringLiteral(self.p_string()?)
-            }
-            Token::Float | Token::Int => {
+            Token::String(_) | Token::LongString(_) => Expr::String(self.p_string(true)?),
+            Token::Number => {
                 let expr = Expr::Number(parse_number(self.get_text()?)?);
                 self.bump();
                 expr
             }
-            Token::OpenBrace => Expr::Table(self.p_tableconstructor()?),
+            Token::OpenBrace => Expr::Table(self.p_tableconstructor(true)?),
             Token::OpenParen => {
                 self.bump();
-                let expr = self.p_exp()?;
-                self.expect(Token::CloseParen)?;
+                let expr = self.p_exp(true)?;
+                self.eat(true, Token::CloseParen)?;
                 Expr::Paren(Box::new(expr))
             }
-            _ => self.p_non_literal()?,
+            _ => self.p_non_literal(expect)?,
         }))
     }
 
     // *** Abandon all hope ye who enter ***
 
     // non-literal = prefix suffix* ;
-    fn p_non_literal(&mut self) -> Option<Expr> {
+    fn p_non_literal(&mut self, expect: bool) -> Option<Expr> {
         dbg_wrap!(self, "p_non_literal", || {
-            let start = self.p_prefix()?;
+            let start = self.p_prefix(expect)?;
             self.p_non_literal_suffix(start)
         })
     }
@@ -732,19 +836,24 @@ impl Parser<'_, '_> {
         )
     }
 
-    fn p_prefix(&mut self) -> Option<Expr> {
+    fn p_prefix(&mut self, expect: bool) -> Option<Expr> {
         dbg_wrap!(self, "p_prefix", || match self.next()?.ty {
             Token::Ident => {
-                let id = self.eat_ident()?.into();
+                let id = self.eat_ident(true)?.into();
                 Some(Expr::Lhs(Lhs::Ident(id)))
             }
             Token::OpenParen => {
                 self.bump();
-                let exp = self.p_exp()?;
-                self.expect(Token::CloseParen)?;
+                let exp = self.p_exp(true)?;
+                self.eat(true, Token::CloseParen)?;
                 Some(Expr::Paren(Box::new(exp)))
             }
-            _ => unimplemented!(),
+            _ => {
+                if expect {
+                    self.tok_err("expected start of expression", vec![]);
+                }
+                None
+            }
         })
     }
 
@@ -759,7 +868,7 @@ impl Parser<'_, '_> {
                 ))))
             }
             _ if self.can_start_call() => {
-                let (method_name, params) = self.p_call()?;
+                let (method_name, params) = self.p_call(true)?;
                 Some(Ok(Expr::Call(match method_name {
                     Some(name) => Call::Method(Box::new(prev), name, params),
                     None => Call::Function(Box::new(prev), params),
@@ -770,15 +879,15 @@ impl Parser<'_, '_> {
     }
 
     // call = args | ':' :ident args ;
-    fn p_call(&mut self) -> Option<(Option<Name>, List<Expr>)> {
+    fn p_call(&mut self, expect: bool) -> Option<(Option<Name>, List<Expr>)> {
         dbg_wrap!(self, "p_call", || {
-            let method_call = if self.eat(Token::Colon).is_some() {
-                Some(self.expect_ident()?.into())
+            let method_call = if self.eat(false, Token::Colon).is_some() {
+                Some(self.eat_ident(true)?.into())
             } else {
                 None
             };
 
-            let args = self.p_args()?;
+            let args = self.p_args(expect || method_call.is_some())?;
             Some((method_call, args))
         })
     }
@@ -788,21 +897,21 @@ impl Parser<'_, '_> {
         dbg_wrap!(self, "p_index", || Some(match self.next()?.ty {
             Token::Dot => {
                 self.bump();
-                Expr::StringLiteral(self.eat_ident()?.into())
+                Expr::String(self.eat_ident(true)?.into())
             }
             Token::OpenBracket => {
                 self.bump();
-                let expr = self.p_exp()?;
-                self.expect(Token::CloseBracket)?;
+                let expr = self.p_exp(true)?;
+                self.eat(true, Token::CloseBracket)?;
                 expr
             }
             _ => unimplemented!(),
         }))
     }
 
-    fn p_var(&mut self) -> Option<Lhs> {
+    fn p_var(&mut self, expect: bool) -> Option<Lhs> {
         dbg_wrap!(self, "p_var", || {
-            match self.p_non_literal()? {
+            match self.p_non_literal(expect)? {
                 Expr::Lhs(lhs) => Some(lhs),
                 _ => {
                     // TODO: Error message
@@ -825,9 +934,9 @@ impl Parser<'_, '_> {
 
     // functioncall := <prefixexp> <args>
     //               | <prefixexp> ":" :name <args> ;;
-    fn p_functioncall(&mut self) -> Option<Call> {
+    fn p_functioncall(&mut self, expect: bool) -> Option<Call> {
         dbg_wrap!(self, "p_functioncall", || {
-            match self.p_non_literal()? {
+            match self.p_non_literal(expect)? {
                 Expr::Call(call) => Some(call),
                 _ => {
                     // TODO: Error message
@@ -839,44 +948,50 @@ impl Parser<'_, '_> {
     }
 
     fn can_start_call(&self) -> bool {
-        self.check(Token::OpenParen)
-            || self.check(Token::Colon)
-            || self.check(Token::OpenBracket)
-            || self.check(Token::LongString)
-            || self.check(Token::SingleQuoteString)
-            || self.check(Token::DoubleQuoteString)
+        match self.next().map(|t| t.ty) {
+            Some(Token::OpenParen)
+            | Some(Token::Colon)
+            | Some(Token::OpenBrace)
+            | Some(Token::LongString(_))
+            | Some(Token::String(_)) => true,
+            _ => false,
+        }
     }
 
     // args := "(" <explist>? ")" | <tableconstructor> | :string ;;
-    fn p_args(&mut self) -> Option<List<Expr>> {
-        dbg_wrap!(self, "p_args", || if self.eat(Token::OpenParen).is_some() {
-            Some(if self.eat(Token::CloseParen).is_some() {
-                vec![]
+    fn p_args(&mut self, expect: bool) -> Option<List<Expr>> {
+        dbg_wrap!(
+            self,
+            "p_args",
+            || if self.eat(false, Token::OpenParen).is_some() {
+                Some(if self.eat(false, Token::CloseParen).is_some() {
+                    vec![]
+                } else {
+                    let exprs = self.p_explist(true)?;
+                    self.eat(true, Token::CloseParen)?;
+                    exprs
+                })
+            } else if let Some(s) = self.p_string(false) {
+                Some(vec![Expr::String(s)])
             } else {
-                let exprs = self.p_explist()?;
-                self.expect(Token::CloseParen)?;
-                exprs
-            })
-        } else if let Some(s) = self.p_string() {
-            Some(vec![Expr::StringLiteral(s)])
-        } else {
-            Some(vec![Expr::Table(self.p_tableconstructor()?)])
-        })
+                Some(vec![Expr::Table(self.p_tableconstructor(true)?)])
+            }
+        )
     }
 
     // funcbody := "(" <parlist>? ")" <block> "end" ;;
-    fn p_funcbody(&mut self) -> Option<Func> {
+    fn p_funcbody(&mut self, expect: bool) -> Option<Func> {
         dbg_wrap!(self, "p_funcbody", || {
-            self.eat(Token::OpenParen)?;
-            let (params, varadic) = if self.eat(Token::CloseParen).is_some() {
+            self.eat(expect, Token::OpenParen)?;
+            let (params, varadic) = if self.eat(false, Token::CloseParen).is_some() {
                 (vec![], false)
             } else {
-                let ret = self.p_parlist()?;
-                self.expect(Token::CloseParen)?;
+                let ret = self.p_parlist(true)?;
+                self.eat(true, Token::CloseParen)?;
                 ret
             };
-            let body = self.p_block()?;
-            self.expect(Token::Kw(Keyword::End))?;
+            let body = self.p_block();
+            self.eat(true, Token::Kw(Keyword::End))?;
             Some(Func {
                 params,
                 body,
@@ -885,48 +1000,107 @@ impl Parser<'_, '_> {
         })
     }
 
-    // parlist := <namelist> ("," "...")? | "..." ;;
-    fn p_parlist(&mut self) -> Option<(List<Name>, bool)> {
-        dbg_wrap!(
-            self,
-            "p_parlist",
-            || if self.eat(Token::DotDotDot).is_some() {
-                Some((vec![], true))
-            } else {
-                let list = self.p_namelist()?;
-                let varadic = self.eat(Token::Comma).is_some();
-                if varadic {
-                    self.expect(Token::DotDotDot)?;
-                }
-                Some((list, varadic))
+    /// Consume input
+    fn try_recover_to_parlist_close(&mut self) {
+        let mut offset = 0;
+
+        while let Some(tok) = self.lookahead(offset) {
+            if tok.ty == Token::CloseParen {
+                self.consume(offset);
+                return;
             }
-        )
+            offset += 1;
+        }
+    }
+
+    // parlist := <namelist> ("," "...")? | "..." ;;
+    // NOTE: we treat this production as follows here, because we want better error reporting of stray varargs.
+    // parlist := (<par-item> ",") ;;
+    // par-item := :ident | "..." ;;
+    // If we encounter any "..." that's not at the end of the parlist, we emit an error.
+    fn p_parlist(&mut self, expect: bool) -> Option<(List<Name>, bool)> {
+        dbg_wrap!(self, "p_parlist", || {
+            let mut err_spans = vec![];
+            // List of parameter names
+            let mut names = vec![];
+            let mut varadic = false;
+
+            // Eat the first `par-item`
+            match self.next().map(|t| t.ty) {
+                // All is normal, push the result to the list of names
+                Some(Token::Ident) => names.push(self.eat_ident(true)?.into()),
+                // We have a varadic function, add the span to the error list if it's not at the end
+                Some(Token::DotDotDot) => {
+                    varadic = true;
+                    let span = self.next().unwrap().span;
+                    self.bump();
+                    if self.check(Token::Comma) {
+                        err_spans.push(span);
+                    }
+                }
+                // wtf, just skip everything to the end of the par list
+                _ => self.try_recover_to_parlist_close(),
+            }
+
+            // Eat a comma and a `par-item`
+            while self.eat(false, Token::Comma).is_some() {
+                let tok_span = self.next().map(|t| t.span);
+                if self.eat(false, Token::DotDotDot).is_some() {
+                    varadic = true;
+                    // Check if we're at the end of the list by checking if the next token is a comma. If it's not at
+                    // the end, add an error.
+                    if self.check(Token::Comma) {
+                        err_spans.push(tok_span.unwrap());
+                    }
+                } else {
+                    // Otherwise, we should have a normal parameter
+                    if let Some(ident) = self.eat_ident(true) {
+                        names.push(ident.into());
+                    } else {
+                        // If we don't, scan to the end of the par list and return.
+                        self.try_recover_to_parlist_close();
+                        break;
+                    }
+                }
+            }
+
+            // Emit errors
+            for span in err_spans {
+                self.span_err(
+                    span,
+                    "unexpected `...`",
+                    vec!["Only varargs that come at the end of a parameter list are valid.".into()],
+                );
+            }
+
+            Some((names, varadic))
+        })
     }
 
     // tableconstructor := "{" <fieldlist>? "}" ;;
-    fn p_tableconstructor(&mut self) -> Option<List<TableEntry>> {
+    fn p_tableconstructor(&mut self, expect: bool) -> Option<List<TableEntry>> {
         dbg_wrap!(self, "p_tableconstructor", || {
-            self.eat(Token::OpenBrace)?;
-            if self.eat(Token::CloseBrace).is_some() {
+            self.eat(expect, Token::OpenBrace)?;
+            if self.eat(false, Token::CloseBrace).is_some() {
                 Some(vec![])
             } else {
-                let list = self.p_fieldlist()?;
-                self.expect(Token::CloseBrace)?;
+                let list = self.p_fieldlist(true)?;
+                self.eat(true, Token::CloseBrace)?;
                 Some(list)
             }
         })
     }
 
     // fieldlist := <field> (<fieldsep> <field>)* <fieldsep>? ;;
-    fn p_fieldlist(&mut self) -> Option<List<TableEntry>> {
+    fn p_fieldlist(&mut self, expect: bool) -> Option<List<TableEntry>> {
         dbg_wrap!(self, "p_fieldlist", || {
             let mut cur_idx = 1;
 
-            let (was_bare_expr, field) = self.p_field(cur_idx)?;
+            let (was_bare_expr, field) = self.p_field(expect, cur_idx)?;
             cur_idx += was_bare_expr as usize;
             let mut fields = vec![field];
             while self.p_fieldsep().is_some() {
-                let (was_bare_expr, field) = self.p_field(cur_idx)?;
+                let (was_bare_expr, field) = self.p_field(true, cur_idx)?;
                 cur_idx += was_bare_expr as usize;
                 fields.push(field);
             }
@@ -937,23 +1111,23 @@ impl Parser<'_, '_> {
     }
 
     // field := "[" <exp> "]" "=" <exp> | :name "=" <exp> | <exp> ;;
-    fn p_field(&mut self, cur_idx: usize) -> Option<(bool, TableEntry)> {
+    fn p_field(&mut self, expect: bool, cur_idx: usize) -> Option<(bool, TableEntry)> {
         dbg_wrap!(
             self,
             "p_field",
-            || if self.eat(Token::OpenBracket).is_some() {
-                let key = self.p_exp()?;
-                self.expect(Token::CloseBracket)?;
-                self.expect(Token::Eq)?;
-                let val = self.p_exp()?;
+            || if self.eat(false, Token::OpenBracket).is_some() {
+                let key = self.p_exp(true)?;
+                self.eat(true, Token::CloseBracket)?;
+                self.eat(true, Token::Eq)?;
+                let val = self.p_exp(true)?;
                 Some((false, TableEntry { key, val }))
-            } else if let Some(key) = self.eat_ident() {
-                self.expect(Token::Eq)?;
-                let val = self.p_exp()?;
+            } else if let Some(key) = self.eat_ident(false) {
+                self.eat(true, Token::Eq)?;
+                let val = self.p_exp(true)?;
                 Some((
                     false,
                     (TableEntry {
-                        key: Expr::StringLiteral(key.into()),
+                        key: Expr::String(key.into()),
                         val,
                     }),
                 ))
@@ -962,7 +1136,7 @@ impl Parser<'_, '_> {
                     true,
                     TableEntry {
                         key: Expr::Number(cur_idx as f64),
-                        val: self.p_exp()?,
+                        val: self.p_exp(expect)?,
                     },
                 ))
             }
@@ -971,11 +1145,16 @@ impl Parser<'_, '_> {
 
     // fieldsep := "," | ";" ;;
     fn p_fieldsep(&mut self) -> Option<()> {
-        dbg_wrap!(self, "p_fieldsep", || {
-            self.eat(Token::Comma)?;
-            self.eat(Token::Semicolon)?;
-            Some(())
-        })
+        dbg_wrap!(
+            self,
+            "p_fieldsep",
+            || if self.eat(false, Token::Comma).is_some() {
+                return Some(());
+            } else {
+                self.eat(false, Token::Semicolon)?;
+                Some(())
+            }
+        )
     }
 
     // binop :=
@@ -1004,61 +1183,31 @@ impl Parser<'_, '_> {
         })
     }
 
-    // Some(ch) => match ch {
-    //     // Normal escape sequence, sonsume it and move on.
-    //     'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' | '"' | '\'' | '\r' | '\n' => {
-    //         self.consume(1);
-    //     }
-
-    //     // Unicode escape, like `\u{CODEPOINT}`
-    //     'u' => {
-    //         self.consume(1);
-    //         self.scan_unicode_escape(escape_start);
-    //     }
-
-    //     // Hex escape, like `\xNN`
-    //     'x' => {
-    //         // consume the `x`
-    //         self.consume(1);
-    //         self.scan_hex_escape(escape_start);
-    //     }
-
-    //     ch if ch.is_digit(10) => {
-    //         self.scan_dec_escape();
-    //     }
-
-    //     ch => self.errs.span_error(
-    //         Span::new(escape_start, self.idx)
-    //             .error_diagnostic()
-    //             .with_message("unknown escape code")
-    //             .with_annotation(
-    //                 Level::Note,
-    //                 format!("I was looking for an escape code, but I found `{}` which is not one", ch),
-    //             ),
-    //     ),
-    // },
-
-    // '\a' (bell), '\b' (backspace), '\f' (form feed), '\n' (newline),
-    // '\r' (carriage return), '\t' (horizontal tab), '\v' (vertical tab),
-    // '\\' (backslash), '\"' (quotation mark [double quote]), and '\'' (apostrophe [single quote]).
-
-    fn p_string(&mut self) -> Option<String> {
+    fn p_string(&mut self, expect: bool) -> Option<String> {
         dbg_wrap!(self, "p_string", || {
             let tok = self.next()?;
-            self.bump();
             Some(match tok.ty {
-                Token::SingleQuoteString => ShortStringParser::parse(self, '\'', *tok),
-                Token::DoubleQuoteString => ShortStringParser::parse(self, '"', *tok),
-                _ => unimplemented!(),
+                Token::String(_) => {
+                    self.bump();
+                    StringParser::parse(self, 1, *tok)
+                }
+                Token::LongString(n) => {
+                    self.bump();
+                    StringParser::parse(self, n, *tok)
+                }
+                _ => {
+                    if expect {
+                        self.tok_err(
+                            "expected string literal",
+                            vec![format!(
+                                "I was looking for a string but I found `{:?}` instead",
+                                tok.ty
+                            )],
+                        );
+                    }
+                    return None;
+                }
             })
-        })
-    }
-
-    fn p_int(&mut self) -> Option<f64> {
-        dbg_wrap!(self, "p_int", || {
-            self.eat(Token::Int)?;
-
-            unimplemented!()
         })
     }
 }
@@ -1099,60 +1248,32 @@ fn binop_token(tok: &Token) -> Option<BinOp> {
         Token::TildeEq => BinOp::NotEq,
 
         Token::Kw(Keyword::And) => BinOp::And,
-        Token::Kw(Keyword::Or) => BinOp::And,
+        Token::Kw(Keyword::Or) => BinOp::Or,
 
         // TODO: error reporting
         _ => return None,
     })
 }
 
-/// Binary operator precedence
-fn binop_prec(op: BinOp) -> usize {
-    match op {
-        BinOp::Or => 0,
-        BinOp::And => 1,
-
-        BinOp::Less => 2,
-        BinOp::LessEq => 2,
-        BinOp::Greater => 2,
-        BinOp::GreaterEq => 2,
-        BinOp::Eq => 2,
-        BinOp::NotEq => 2,
-
-        BinOp::BitOr => 3,
-        BinOp::BitXor => 4,
-        BinOp::BitAnd => 5,
-        BinOp::BitShr => 6,
-        BinOp::BitShl => 6,
-        BinOp::Concat => 7,
-
-        BinOp::Add => 8,
-        BinOp::Sub => 8,
-        BinOp::Mul => 9,
-        BinOp::Div => 9,
-        BinOp::FloorDiv => 9,
-        BinOp::Mod => 9,
-        BinOp::Exp => 10,
-    }
-}
-
-struct ShortStringParser<'src, 'ctx> {
+struct StringParser<'src, 'ctx> {
     src: &'src str,
-    str_delim: char,
+    remaining: usize,
     idx: Index,
     char_start: Index,
     buf: String,
     errs: &'ctx mut ErrorManager,
 }
 
-impl<'src, 'ctx> ShortStringParser<'src, 'ctx> {
-    fn parse(p: &mut Parser<'src, 'ctx>, delim: char, tok: SpannedToken) -> String {
-        let mut p = ShortStringParser {
+impl<'src, 'ctx> StringParser<'src, 'ctx> {
+    fn parse(p: &mut Parser<'src, 'ctx>, delim_len: usize, tok: SpannedToken) -> String {
+        let span = tok.span.shrink_n_same_line(delim_len);
+        let len = span.byte_len();
+        let mut p = StringParser {
             src: p.src,
-            str_delim: delim,
-            idx: tok.span.start,
-            char_start: tok.span.start,
-            buf: String::with_capacity(tok.span.end.byte - tok.span.start.byte),
+            remaining: len,
+            idx: span.start,
+            char_start: span.start,
+            buf: String::with_capacity(len),
             errs: p.errs,
         };
         p.p_short_string();
@@ -1160,16 +1281,22 @@ impl<'src, 'ctx> ShortStringParser<'src, 'ctx> {
     }
 }
 
-impl<'src> ShortStringParser<'src, '_> {
+impl<'src> StringParser<'src, '_> {
     fn get_ch(&mut self) -> char {
+        self.remaining -= 1;
         let ch = self.src[self.idx.byte..].chars().next().unwrap();
         self.idx = self.idx.advance_by(ch);
         ch
     }
 
+    fn peek_ch(&self, offset: usize) -> char {
+        self.src[self.idx.byte + offset..].chars().next().unwrap()
+    }
+
     fn get_str(&mut self, len: usize) -> &'src str {
         let s = &self.src[self.idx.byte..self.idx.byte + len];
         for ch in s.chars() {
+            self.remaining -= 1;
             self.idx = self.idx.advance_by(ch);
         }
         s
@@ -1188,32 +1315,74 @@ impl<'src> ShortStringParser<'src, '_> {
         }
     }
 
+    fn expect(&mut self, ch: char) {
+        let next = self.get_ch();
+        if next != ch {
+            self.errs.span_error(
+                Span::new(self.idx, self.idx.advance_by(next))
+                    .error_diagnostic()
+                    .with_message("unexpected character")
+                    .with_annotation(
+                        Level::Note,
+                        format!("I was looking for `{}`, but I found `{}` :c", ch, next),
+                    ),
+            )
+        }
+    }
+
+    fn escape_unicode(&mut self) {
+        self.expect('{');
+        let start = self.idx;
+        let mut len = 0;
+        while self.peek_ch(len).is_digit(16) {
+            len += 1;
+        }
+        let s = self.get_str(len);
+        let ch = match u32::from_str_radix(s, 16)
+            .ok()
+            .and_then(|num| std::char::from_u32(num))
+        {
+            Some(num) => num,
+            None => {
+                self.errs.span_error(
+                    Span::new(start, self.idx)
+                        .error_diagnostic()
+                        .with_message("invalid codepoint"),
+                );
+                return;
+            }
+        };
+        self.buf.push(ch);
+        self.expect('}');
+    }
+
     fn escape_code(&mut self, code: char) {
         match code {
             'a' => self.buf.push('\x07'),
             'b' => self.buf.push('\x08'),
+            't' => self.buf.push('\x09'),
             'n' => self.buf.push('\x0A'),
+            'v' => self.buf.push('\x0B'),
             'f' => self.buf.push('\x0C'),
             'r' => self.buf.push('\x0D'),
-            't' => self.buf.push('\x09'),
-            'v' => self.buf.push('\x0B'),
             '\\' => self.buf.push('\\'),
             '"' => self.buf.push('"'),
             '\'' => self.buf.push('\''),
-            'x' => {}
+            '\n' => self.buf.push('\n'),
+            'x' => self.escape_hex(),
+            'u' => self.escape_unicode(),
             _ => panic!("lexer allowed invalid escape code"),
         }
     }
 
     fn p_short_string(&mut self) {
-        loop {
+        while self.remaining > 0 {
             self.char_start = self.idx;
             match self.get_ch() {
                 '\\' => {
                     let ch = self.get_ch();
                     self.escape_code(ch)
                 }
-                ch if ch == self.str_delim => break,
                 ch => self.buf.push(ch),
             }
         }

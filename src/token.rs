@@ -99,12 +99,74 @@ pub enum Token {
     DotDot,
     DotDotDot,
 
-    Float,
-    Int,
-    DoubleQuoteString,
-    SingleQuoteString,
-    LongString,
+    Number,
+    String(char),
+    LongString(usize),
     Ident,
+    Unknown(char),
+}
+
+#[macro_export]
+#[cfg_attr(rustfmt, rustfmt_skip)]
+macro_rules! tok {
+    (and) => {Token::Kw(Keyword::And)};
+    (break) => {Token::Kw(Keyword::Break)};
+    (do) => {Token::Kw(Keyword::Do)};
+    (else) => {Token::Kw(Keyword::Else)};
+    (elseif) => {Token::Kw(Keyword::ElseIf)};
+    (end) => {Token::Kw(Keyword::End)};
+    (false) => {Token::Kw(Keyword::False)};
+    (for) => {Token::Kw(Keyword::For)};
+    (function) => {Token::Kw(Keyword::Function)};
+    (goto) => {Token::Kw(Keyword::Goto)};
+    (if) => {Token::Kw(Keyword::If)};
+    (in) => {Token::Kw(Keyword::In)};
+    (local) => {Token::Kw(Keyword::Local)};
+    (nil) => {Token::Kw(Keyword::Nil)};
+    (not) => {Token::Kw(Keyword::Not)};
+    (or) => {Token::Kw(Keyword::Or)};
+    (repeat) => {Token::Kw(Keyword::Repeat)};
+    (return) => {Token::Kw(Keyword::Return)};
+    (then) => {Token::Kw(Keyword::Then)};
+    (true) => {Token::Kw(Keyword::True)};
+    (until) => {Token::Kw(Keyword::Until)};
+    (while) => {Token::Kw(Keyword::While)};
+
+    (+) => {Token::Plus};
+    (-) => {Token::Minus};
+    (*) => {Token::Star};
+    (/) => {Token::Slash};
+    (%) => {Token::Percent};
+    (^) => {Token::Exp};
+    (#) => {Token::Hash};
+    (&) => {Token::BitAnd};
+    (~) => {Token::Tilde};
+    (|) => {Token::BitOr};
+    (<<) => {Token::LtLt};
+    (>>) => {Token::GtGt};
+    ("//") => {Token::ShashSlash};
+    (::) => {Token::ColonColon};
+    (==) => {Token::EqEq};
+    (~=) => {Token::TildeEq};
+    (<=) => {Token::LtEq};
+    (>=) => {Token::GtEq};
+    (<) => {Token::Lt};
+    (>) => {Token::Gt};
+    (=) => {Token::Eq};
+
+    ("(") => {Token::OpenParen};
+    (")") => {Token::CloseParen};
+    ("{") => {Token::OpenBrace};
+    ("}") => {Token::CloseBrace};
+    ("[") => {Token::OpenBracket};
+    ("]") => {Token::CloseBracket};
+
+    (;) => {Token::Semicolon};
+    (:) => {Token::Colon};
+    (,) => {Token::Comma};
+    (.) => {Token::Dot};
+    (..) => {Token::DotDot};
+    (...) => {Token::DotDotDot};
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -194,9 +256,9 @@ impl Tokenizer<'_, '_> {
             Some('.') => {
                 self.consume(1);
                 self.scan_while(|ch| ch.is_digit(radix));
-                Token::Float
+                Token::Number
             }
-            _ => Token::Int,
+            _ => Token::Number,
         }
     }
 
@@ -409,11 +471,13 @@ impl Tokenizer<'_, '_> {
         self.consume(1);
     }
 
-    fn scan_raw_string(&mut self) {
+    fn scan_raw_string(&mut self) -> usize {
         debug_assert!(self.next(0) == Some('['));
         let start = self.idx;
         self.consume(1);
         let level = self.scan_while(|ch| ch == '=');
+        // The two brackets plus the number of `=`s
+        let delim_len = level + 2;
 
         if !self.eat('[') {
             self.errs.span_error(
@@ -425,7 +489,7 @@ impl Tokenizer<'_, '_> {
                         "I was looking for a `[`, but I did not find one",
                     ),
             );
-            return;
+            return delim_len;
         }
 
         loop {
@@ -440,7 +504,7 @@ impl Tokenizer<'_, '_> {
                         // Correct formatting, exit the loop.
                         if self.next(0) == Some(']') {
                             self.consume(1);
-                            break;
+                            return delim_len;
                         }
                     }
                 }
@@ -452,7 +516,7 @@ impl Tokenizer<'_, '_> {
                             .error_diagnostic()
                             .with_message(format!("unterminated {}-level long string", level)),
                     );
-                    return;
+                    return delim_len;
                 }
             }
         }
@@ -597,8 +661,8 @@ impl Tokenizer<'_, '_> {
 
             '[' => match self.next(1) {
                 Some('[') | Some('=') => {
-                    self.scan_raw_string();
-                    Token::LongString
+                    let level = self.scan_raw_string();
+                    Token::LongString(level)
                 }
                 _ => {
                     self.consume(1);
@@ -641,14 +705,22 @@ impl Tokenizer<'_, '_> {
             // Scan each type of string.
             '"' => {
                 self.scan_string('"');
-                Token::DoubleQuoteString
+                Token::String('"')
             }
             '\'' => {
                 self.scan_string('\'');
-                Token::SingleQuoteString
+                Token::String('\'')
             }
 
-            _ => unimplemented!(),
+            ch => {
+                self.consume(1);
+                self.errs.span_error(
+                    Span::new(start_idx, start_idx.advance_by(ch))
+                        .error_diagnostic()
+                        .with_message("unknown token"),
+                );
+                Token::Unknown(ch)
+            }
         };
 
         Some(self.make_token(start_idx, tok))

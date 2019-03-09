@@ -1,4 +1,5 @@
 use crate::span::Span;
+use std::borrow::Cow;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Level {
@@ -9,16 +10,18 @@ pub enum Level {
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Diagnostic {
-    pub span: Span,
+    pub primary_span: Span,
+    pub spans: Vec<Span>,
     pub level: Level,
-    pub message: Option<String>,
-    pub annotations: Vec<(Level, String)>,
+    pub message: Option<Cow<'static, str>>,
+    pub annotations: Vec<(Level, Cow<'static, str>)>,
 }
 
 impl From<Span> for Diagnostic {
     fn from(span: Span) -> Self {
         Diagnostic {
-            span,
+            primary_span: span,
+            spans: vec![],
             level: Level::Error,
             message: None,
             annotations: vec![],
@@ -32,13 +35,18 @@ impl Diagnostic {
         self
     }
 
-    pub fn with_message<T: Into<String>>(mut self, message: T) -> Self {
+    pub fn with_message<T: Into<Cow<'static, str>>>(mut self, message: T) -> Self {
         self.message = Some(message.into());
         self
     }
 
-    pub fn with_annotation<T: Into<String>>(mut self, level: Level, ann: T) -> Self {
+    pub fn with_annotation<T: Into<Cow<'static, str>>>(mut self, level: Level, ann: T) -> Self {
         self.annotations.push((level, ann.into()));
+        self
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.spans.push(span);
         self
     }
 }
@@ -79,27 +87,27 @@ impl ErrorManager {
     }
 
     pub fn emit(&mut self, src: &str) {
-        for span in self.err_spans.drain(..) {
-            let start = span.span.start;
-            let end = span.span.end;
-            let main_style = level_style(span.level);
+        for diag in self.err_spans.drain(..) {
+            let start = diag.primary_span.start;
+            let end = diag.primary_span.end;
+            let main_style = level_style(diag.level);
 
             print!(
                 "{} at {}{}:{}{}",
-                main_style.paint(level_str(span.level)),
+                main_style.paint(level_str(diag.level)),
                 Style::new().bold().prefix(),
                 start.line + 1,
                 start.column + 1,
                 Style::new().bold().suffix(),
             );
 
-            if let Some(message) = span.message {
+            if let Some(message) = diag.message {
                 print!(": {}", message);
             }
 
             println!();
 
-            for (level, ann) in span.annotations {
+            for (level, ann) in diag.annotations {
                 println!(
                     " >> {}: {}",
                     level_style(level).paint(level_str(level)),
